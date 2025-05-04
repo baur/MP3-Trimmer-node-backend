@@ -4,6 +4,7 @@ const ffmpeg = require("fluent-ffmpeg");
 const NodeID3 = require("node-id3");
 const fs = require("fs").promises;
 const path = require("path");
+const { v4: uuidv4 } = require("uuid"); // Для генерации GUID
 
 const app = express();
 const upload = multer({
@@ -24,40 +25,44 @@ app.use((req, res, next) => {
   next();
 });
 
+// Эндпоинт для загрузки MP3 и возврата URL
+app.post("/upload", upload.single("audio"), async (req, res) => {
+  try {
+    if (!req.file) throw new Error("Аудиофайл не загружен");
+    const guid = uuidv4();
+    const newPath = path.join(__dirname, "uploads", `${guid}.mp3`);
+    await fs.rename(req.file.path, newPath);
+    const url = `http://localhost:5000/audio/${guid}`;
+    console.log("url:", url);
+    res.json({ url });
+  } catch (error) {
+    console.error("Upload error:", error);
+    res.status(500).send("Ошибка загрузки: " + error.message);
+  }
+});
+
+// Обновленный эндпоинт /trim
 app.post(
   "/trim",
-  upload.fields([
-    { name: "audio", maxCount: 1 },
-    { name: "cover", maxCount: 1 },
-  ]),
+  upload.single("cover"),
   async (req, res) => {
     try {
-      console.log("Request Files:", req.files);
-      console.log("Processing trim request:", req.body, req.files);
+      const { guid, start, end, title, artist, album, publisher } = req.body;
 
-      const { start, end, title, artist, album, publisher } = req.body;
+      if (!guid) throw new Error("GUID не предоставлен");
 
-      if (!req.files || !req.files.audio) {
-        throw new Error("Аудиофайл не был загружен");
+      const inputPath = path.join(__dirname, "uploads", `${guid}.mp3`);
+      if (!(await fs.access(inputPath).then(() => true).catch(() => false))) {
+        throw new Error("Файл не найден");
       }
 
       const startSec = parseFloat(start);
       const endSec = parseFloat(end);
-      if (
-        isNaN(startSec) ||
-        isNaN(endSec) ||
-        startSec < 0 ||
-        endSec <= startSec
-      ) {
+      if (isNaN(startSec) || isNaN(endSec) || startSec < 0 || endSec <= startSec) {
         throw new Error("Некорректные значения времени");
       }
 
-      const inputPath = req.files.audio[0].path;
-      const outputPath = path.join(
-        __dirname,
-        "outputs",
-        `trimmed_${Date.now()}.mp3`
-      );
+      const outputPath = path.join(__dirname, "outputs", `trimmed_${Date.now()}.mp3`);
 
       await new Promise((resolve, reject) => {
         ffmpeg(inputPath)
@@ -76,59 +81,77 @@ app.post(
       });
 
       const tags = { title, artist, album, publisher };
-      const cover = req.files?.cover;
+      const cover = req.file;
 
       if (cover) {
-        const coverFile = req.files.cover[0];
-        const coverPath = coverFile.path;
-        const coverMime = coverFile.mimetype;
-
-        if (coverMime !== "image/jpeg") {
-          console.warn("Cover is not a JPEG image, converting to JPEG if needed.");
-        }
-
-        console.log("Cover file:", coverFile);
-        console.log("Cover path:", coverPath);
-
+        const coverPath = cover.path;
+        const coverMime = cover.mimetype;
         const imageBuffer = await fs.readFile(coverPath);
-
         tags.image = {
           mime: coverMime,
-          type: {
-            id: 3,
-            name: "front cover",
-          },
+          type: { id: 3, name: "front cover" },
           description: "Cover",
-          imageBuffer: imageBuffer,
+          imageBuffer,
         };
-        console.log("Cover file assigned successfully");
       }
 
       const result = await NodeID3.write(tags, outputPath);
-      if (!result) {
-        console.error("Failed to write ID3 tags");
-      } else {
-        console.log("ID3 tags added successfully");
-      }
+      if (!result) console.error("Failed to write ID3 tags");
 
       res.download(outputPath, "trimmed.mp3", async (err) => {
         if (err) console.error("Download error:", err);
-        console.log("Cleaning up files");
         await fs.unlink(inputPath).catch(console.error);
-        if (cover) await fs.unlink(cover[0].path).catch(console.error);
+        if (cover) await fs.unlink(cover.path).catch(console.error);
         await fs.unlink(outputPath).catch(console.error);
       });
     } catch (error) {
       console.error("Processing error:", error);
-      res.status(500).send("Error processing audio: " + error.message);
-      if (req.files?.audio)
-        await fs.unlink(req.files.audio[0].path).catch(console.error);
-      if (req.files?.cover)
-        await fs.unlink(req.files.cover[0].path).catch(console.error);
+      res.status(500).send("Ошибка обработки: " + error.message);
     }
   }
 );
 
+
+app.get("/audio/:guid", async (req, res) => {
+  try {
+    const { guid } = req.params;
+    const filePath = path.join(__dirname, "uploads", `${guid}.mp3`);
+    if (!(await fs.access(filePath).then(() => true).catch(() => false))) {
+      return res.status(404).send("Файл не найден");
+    }
+    res.sendFile(filePath);
+  } catch (error) {
+    console.error("Ошибка при получении файла:", error);
+    res.status(500).send("Ошибка сервера");
+  }
+});
+
+fs.mkdir(path.join(__dirname, "uploads"), { recursive: true });
 fs.mkdir(path.join(__dirname, "outputs"), { recursive: true });
 
-app.listen(5000, () => console.log("Server running on port 5000"));
+// Функция для удаления файлов старше 3 часов
+const cleanOldFiles = async () => {
+  try {
+    const uploadsDir = path.join(__dirname, "uploads");
+    const files = await fs.readdir(uploadsDir);
+    // const threeHoursAgo = Date.now() - 3 * 60 * 60 * 1000; // 3 часа в миллисекундах
+    const threeHoursAgo = Date.now() -  60 * 1000; // 3 часа в миллисекундах
+
+    for (const file of files) {
+      const filePath = path.join(uploadsDir, file);
+      const stats = await fs.stat(filePath);
+      if (stats.mtimeMs < threeHoursAgo) {
+        await fs.unlink(filePath);
+        console.log(`Удален старый файл: ${file}`);
+      }
+    }
+  } catch (error) {
+    console.error("Ошибка при очистке старых файлов:", error);
+  }
+};
+
+// Запуск очистки каждые 30 минут
+// setInterval(cleanOldFiles, 30 * 60 * 1000);
+setInterval(cleanOldFiles, 60 * 1000);
+
+app.listen(5000, () => console.log("Сервер запущен на порту 5000"));
